@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(find '/c/Users/Jason/Documents/PlatformIO/Projects/Light Controller' -type f -name *.html -o -name *.css -o -name *.js -o -name *.cpp -o -name *.h)",
-      "Bash(find '/c/Users/Jason/Documents/PlatformIO/Projects/Light Controller' -type f \\\\\\(-name *.html -o -name *.css -o -name *.js \\\\\\))"
-    ]
-  }
-}
