@@ -429,7 +429,10 @@ input[type=time],input[type=number],select{background:var(--bg);border:1px solid
     <input type="range" id="senThr" min="0" max="4095" value="500" oninput="document.getElementById('senThrV').textContent=this.value" onchange="saveSensor()">
     <span class="val" id="senThrV" style="min-width:44px">500</span>
   </div>
-  <div style="font-size:.68rem;color:var(--muted);margin:-8px 0 10px 98px">&#9432; Trigger when ADC reading falls below this</div>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin:-8px 0 10px 98px">
+    <span style="font-size:.68rem;color:var(--muted)">&#9432; Trigger when ADC reading falls below this</span>
+    <button class="btn-s" style="background:var(--border);color:var(--text);white-space:nowrap" onclick="setBaseline()">Use Current</button>
+  </div>
   <div class="row">
     <label class="lbl">When Dark</label>
     <select id="senAct" onchange="onSenAct();saveSensor()" style="flex:1">
@@ -542,10 +545,20 @@ function saveSensor(){
   });
 }
 
+function setBaseline(){
+  get('/api/sensor/reading',d=>{
+    if(d==null||d.value===undefined) return;
+    const thr=Math.min(d.value,4095);
+    document.getElementById('senThr').value=thr;
+    document.getElementById('senThrV').textContent=thr;
+    saveSensor();
+  });
+}
+
 // ---- Sensor reading poll ----
 function pollSensor(){
   get('/api/sensor/reading',d=>{
-    document.getElementById('senReading').textContent='ADC: '+d.value;
+document.getElementById('senReading').textContent='ADC: '+(d!=null&&d.value!==undefined?d.value:'—');
   });
 }
 
@@ -738,6 +751,12 @@ void setupRoutes() {
     });
   server.addHandler(togSchedH);
 
+  // ---- GET /api/sensor/reading (must be before /api/sensor) ----
+  server.on("/api/sensor/reading", HTTP_GET, [](AsyncWebServerRequest* req) {
+    int v = analogRead(PIN_LIGHT_SENSOR);
+    req->send(200, "application/json", "{\"value\":" + String(v) + "}");
+  });
+
   // ---- GET /api/sensor ----
   server.on("/api/sensor", HTTP_GET, [](AsyncWebServerRequest* req) {
     req->send(200, "application/json", sensorJson());
@@ -755,12 +774,6 @@ void setupRoutes() {
       req->send(200, "application/json", "{\"ok\":true}");
     });
   server.addHandler(sensorH);
-
-  // ---- GET /api/sensor/reading ----
-  server.on("/api/sensor/reading", HTTP_GET, [](AsyncWebServerRequest* req) {
-    int v = analogRead(PIN_LIGHT_SENSOR);
-    req->send(200, "application/json", "{\"value\":" + String(v) + "}");
-  });
 }
 
 // ============================================================
