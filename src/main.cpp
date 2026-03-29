@@ -10,6 +10,7 @@
  * Hardware:
  *   - GPIO 25 → MOSFET gate for Warm White channel
  *   - GPIO 26 → MOSFET gate for Cool White channel
+ *   - GPIO 27 → MOSFET gate for Candle channel (digital on/off, 3.3V rail)
  *   - GPIO 34 → LDR/Photodiode voltage divider (ADC input only, no pullup)
  *
  * Wiring notes:
@@ -47,6 +48,7 @@ const int   DAYLIGHT_OFFSET_SEC = 3600;   // 3600 if your region uses DST, else 
 #define PIN_WARM_WHITE   25
 #define PIN_COOL_WHITE   26
 #define PIN_LIGHT_SENSOR 34   // ADC1 channel — must be input-only pin
+#define PIN_CANDLES      27   // Digital on/off for candle circuit (MOSFET gate)
 
 // --- LEDC (PWM) config ---
 #define PWM_FREQ        1000   // Hz — above audible whine range for most strips
@@ -79,6 +81,18 @@ struct SensorConfig {
   uint8_t dimLevel  = 20;    // brightness % used when action == "dim"
 };
 
+struct CandleState {
+  bool on = false;
+};
+
+struct CandleSchedule {
+  String  id;
+  String  time;    // "HH:MM" 24-hour
+  bool    on;      // true = turn on, false = turn off
+  bool    enabled;
+  bool    days[7]; // index 0 = Sunday … 6 = Saturday
+};
+
 // ============================================================
 //  Globals
 // ============================================================
@@ -95,6 +109,11 @@ unsigned long lastScheduleCheck = 0;  // millis
 unsigned long lastSensorCheck   = 0;
 int           lastMinuteChecked = -1; // prevents multiple firings per minute
 
+CandleState candleState;
+std::vector<CandleSchedule> candleScheds;
+unsigned long lastCandleSchedCheck = 0;
+int           lastCandleMinChecked = -1;
+
 // ============================================================
 //  PWM helpers
 // ============================================================
@@ -108,6 +127,10 @@ void applyState(const LightState& s) {
   float ct  = constrain(s.colorTemp,  0, 100) / 100.0f;
   ledcWrite(LEDC_CH_WARM, (uint8_t)(255.0f * bri * (1.0f - ct)));
   ledcWrite(LEDC_CH_COOL, (uint8_t)(255.0f * bri * ct));
+}
+
+void applyCandles() {
+  digitalWrite(PIN_CANDLES, candleState.on ? HIGH : LOW);
 }
 
 // ============================================================
@@ -203,6 +226,62 @@ void loadSensorCfg() {
   f.close();
 }
 
+void saveCandleState() {
+  File f = SPIFFS.open("/candles.json", "w");
+  if (!f) return;
+  StaticJsonDocument<64> doc;
+  doc["on"] = candleState.on;
+  serializeJson(doc, f);
+  f.close();
+}
+
+void loadCandleState() {
+  if (!SPIFFS.exists("/candles.json")) return;
+  File f = SPIFFS.open("/candles.json", "r");
+  if (!f) return;
+  StaticJsonDocument<64> doc;
+  if (!deserializeJson(doc, f)) candleState.on = doc["on"] | false;
+  f.close();
+}
+
+void saveCandleScheds() {
+  File f = SPIFFS.open("/candle_scheds.json", "w");
+  if (!f) return;
+  DynamicJsonDocument doc(4096);
+  JsonArray arr = doc.to<JsonArray>();
+  for (auto& s : candleScheds) {
+    JsonObject obj = arr.createNestedObject();
+    obj["id"]      = s.id;
+    obj["time"]    = s.time;
+    obj["on"]      = s.on;
+    obj["enabled"] = s.enabled;
+    JsonArray d = obj.createNestedArray("days");
+    for (int i = 0; i < 7; i++) d.add(s.days[i]);
+  }
+  serializeJson(doc, f);
+  f.close();
+}
+
+void loadCandleScheds() {
+  if (!SPIFFS.exists("/candle_scheds.json")) return;
+  File f = SPIFFS.open("/candle_scheds.json", "r");
+  if (!f) return;
+  DynamicJsonDocument doc(4096);
+  if (deserializeJson(doc, f)) { f.close(); return; }
+  candleScheds.clear();
+  for (JsonObject obj : doc.as<JsonArray>()) {
+    CandleSchedule s;
+    s.id      = obj["id"].as<String>();
+    s.time    = obj["time"].as<String>();
+    s.on      = obj["on"]      | true;
+    s.enabled = obj["enabled"] | true;
+    JsonArray d = obj["days"].as<JsonArray>();
+    for (int i = 0; i < 7 && i < (int)d.size(); i++) s.days[i] = (bool)d[i];
+    candleScheds.push_back(s);
+  }
+  f.close();
+}
+
 // ============================================================
 //  Schedule checker  (called once per minute)
 // ============================================================
@@ -229,6 +308,29 @@ void checkSchedules() {
     applyState(currentState);
     saveState();
     Serial.printf("[Schedule] Fired: %s  bri=%d  ct=%d\n", hhmm, s.brightness, s.colorTemp);
+  }
+}
+
+void checkCandleSchedules() {
+  struct tm ti;
+  if (!getLocalTime(&ti)) return;
+
+  int minute = ti.tm_hour * 60 + ti.tm_min;
+  if (minute == lastCandleMinChecked) return;
+  lastCandleMinChecked = minute;
+
+  char hhmm[6];
+  snprintf(hhmm, sizeof(hhmm), "%02d:%02d", ti.tm_hour, ti.tm_min);
+  int dow = ti.tm_wday;
+
+  for (auto& s : candleScheds) {
+    if (!s.enabled)     continue;
+    if (!s.days[dow])   continue;
+    if (s.time != hhmm) continue;
+    candleState.on = s.on;
+    applyCandles();
+    saveCandleState();
+    Serial.printf("[CandleSched] Fired: %s  on=%d\n", hhmm, s.on);
   }
 }
 
@@ -324,6 +426,7 @@ input[type=time],input[type=number],select{background:var(--bg);border:1px solid
 .qa-lbl{font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;display:block}
 .qa-btn.active{background:var(--accent);color:#000}
 .qa-btn.cool-active{background:var(--cool);color:#000}
+.qa-btn:last-child:nth-child(3n+1){grid-column:2}
 </style>
 </head>
 <body>
@@ -356,6 +459,10 @@ input[type=time],input[type=number],select{background:var(--bg);border:1px solid
     <button class="qa-btn" onclick="qaFullWarm()">
       <span class="qa-icon">&#127774;</span>
       <span class="qa-lbl">Full Warm</span>
+    </button>
+    <button class="qa-btn" id="qaCandles" onclick="qaToggleCandles()">
+      <span class="qa-icon">&#128367;</span>
+      <span class="qa-lbl">Candles</span>
     </button>
   </div>
 </div>
@@ -446,6 +553,45 @@ input[type=time],input[type=number],select{background:var(--bg);border:1px solid
     <input type="range" id="senDim" min="1" max="100" value="20" oninput="document.getElementById('senDimV').textContent=this.value+'%'" onchange="saveSensor()">
     <span class="val" id="senDimV">20%</span>
   </div>
+</div>
+
+<!-- CANDLES CARD -->
+<div class="card">
+  <h2>Candles</h2>
+  <div class="row">
+    <label class="lbl">Power</label>
+    <label class="tog">
+      <input type="checkbox" id="candlePwr" onchange="sendCandleState()">
+      <span class="tslider"></span>
+    </label>
+    <span id="candleLbl" style="font-size:.8rem;color:var(--muted)">OFF</span>
+  </div>
+  <div id="candleSchedList"></div>
+  <details id="candleAddForm">
+    <summary>+ Add Schedule</summary>
+    <div style="margin-top:12px">
+      <div class="frow">
+        <div class="fg"><label>Time</label><input type="time" id="cTime" value="20:00"></div>
+        <div class="fg"><label>Action</label>
+          <select id="cAction">
+            <option value="on">Turn On</option>
+            <option value="off">Turn Off</option>
+          </select>
+        </div>
+      </div>
+      <div style="font-size:.72rem;color:var(--muted);margin-bottom:6px">Days active:</div>
+      <div class="days" id="cDays">
+        <span class="day" data-d="0">Su</span>
+        <span class="day on" data-d="1">Mo</span>
+        <span class="day on" data-d="2">Tu</span>
+        <span class="day on" data-d="3">We</span>
+        <span class="day on" data-d="4">Th</span>
+        <span class="day on" data-d="5">Fr</span>
+        <span class="day" data-d="6">Sa</span>
+      </div>
+      <button class="btn-p" style="margin-top:12px" onclick="addCandleSchedule()">Save Schedule</button>
+    </div>
+  </details>
 </div>
 
 <div class="foot">
@@ -562,11 +708,64 @@ document.getElementById('senReading').textContent='ADC: '+(d!=null&&d.value!==un
   });
 }
 
+// ---- Candles ----
+let candleScheds = [];
+function sendCandleState(){
+  const on = document.getElementById('candlePwr').checked;
+  document.getElementById('candleLbl').textContent = on ? 'ON' : 'OFF';
+  post('/api/candles', {on});
+  updateQaStates();
+}
+function loadCandleState(){
+  get('/api/candles', d=>{
+    document.getElementById('candlePwr').checked = d.on;
+    document.getElementById('candleLbl').textContent = d.on ? 'ON' : 'OFF';
+    updateQaStates();
+  });
+}
+function loadCandleScheds(){
+  get('/api/candle/schedules', data=>{ candleScheds=data; renderCandleScheds(); });
+}
+function renderCandleScheds(){
+  const el = document.getElementById('candleSchedList');
+  if(!candleScheds.length){ el.innerHTML='<p style="color:var(--muted);font-size:.78rem;margin-bottom:8px">No schedules yet.</p>'; return; }
+  el.innerHTML = candleScheds.map(s=>`
+    <div class="sched-item">
+      <span class="sched-time">${s.time}</span>
+      <span class="sched-info">
+        <span style="color:${s.on?'var(--accent)':'var(--muted)'}">${s.on?'Turn On':'Turn Off'}</span>
+        <div class="days">${[0,1,2,3,4,5,6].map(i=>`<span class="day ${s.days[i]?'on':''}">${DN[i]}</span>`).join('')}</div>
+      </span>
+      <label class="tog" style="width:44px;height:24px">
+        <input type="checkbox" ${s.enabled?'checked':''} onchange="toggleCandleSched('${s.id}',this.checked)">
+        <span class="tslider"></span>
+      </label>
+      <button class="btn-d btn-s" onclick="deleteCandleSched('${s.id}')">&#x2715;</button>
+    </div>`).join('');
+}
+function addCandleSchedule(){
+  const days=[0,0,0,0,0,0,0];
+  document.querySelectorAll('#cDays .day').forEach(el=>{
+    if(el.classList.contains('on')) days[+el.dataset.d]=1;
+  });
+  post('/api/candle/schedules',{
+    time: document.getElementById('cTime').value,
+    on:   document.getElementById('cAction').value==='on',
+    enabled: true, days
+  }, ()=>{ document.getElementById('candleAddForm').removeAttribute('open'); loadCandleScheds(); });
+}
+function deleteCandleSched(id){ post('/api/candle/schedule/delete',{id},loadCandleScheds); }
+function toggleCandleSched(id,enabled){ post('/api/candle/schedule/toggle',{id,enabled},loadCandleScheds); }
+document.querySelectorAll('#cDays .day').forEach(el=>{
+  el.addEventListener('click',()=>el.classList.toggle('on'));
+});
+
 // ---- Quick Actions ----
 function updateQaStates(){
   document.getElementById('qaOnOff').classList.toggle('active', document.getElementById('pwr').checked);
   document.getElementById('qaSensor').classList.toggle('active', document.getElementById('senEn').checked);
   document.getElementById('qaSchedule').classList.toggle('active', scheds.some(s=>s.enabled));
+  document.getElementById('qaCandles').classList.toggle('active', document.getElementById('candlePwr').checked);
 }
 function qaTogglePower(){
   const el=document.getElementById('pwr'); el.checked=!el.checked;
@@ -603,6 +802,10 @@ function qaFullWarm(){
   document.getElementById('ct').value=0; onCt(0);
   sendState(); updateQaStates();
 }
+function qaToggleCandles(){
+  const el=document.getElementById('candlePwr'); el.checked=!el.checked;
+  sendCandleState();
+}
 
 // ---- Fetch helpers ----
 function get(url, cb){
@@ -627,7 +830,7 @@ function tick(){
 }
 
 // ---- Init ----
-loadState(); loadSchedules(); loadSensor(); tick();
+loadState(); loadSchedules(); loadSensor(); loadCandleState(); loadCandleScheds(); tick();
 setStatus('Connected');
 setInterval(tick, 15000);
 setInterval(pollSensor, 4000);
@@ -670,6 +873,25 @@ String schedulesJson() {
     for (int i = 0; i < 7; i++) d.add(s.days[i]);
   }
   String s; serializeJson(doc, s); return s;
+}
+
+String candleStateJson() {
+  return candleState.on ? "{\"on\":true}" : "{\"on\":false}";
+}
+
+String candleSchedsJson() {
+  DynamicJsonDocument doc(4096);
+  JsonArray arr = doc.to<JsonArray>();
+  for (auto& s : candleScheds) {
+    JsonObject obj = arr.createNestedObject();
+    obj["id"]      = s.id;
+    obj["time"]    = s.time;
+    obj["on"]      = s.on;
+    obj["enabled"] = s.enabled;
+    JsonArray d = obj.createNestedArray("days");
+    for (int i = 0; i < 7; i++) d.add(s.days[i]);
+  }
+  String out; serializeJson(doc, out); return out;
 }
 
 String makeId() {
@@ -774,6 +996,67 @@ void setupRoutes() {
       req->send(200, "application/json", "{\"ok\":true}");
     });
   server.addHandler(sensorH);
+
+  // ---- GET /api/candles ----
+  server.on("/api/candles", HTTP_GET, [](AsyncWebServerRequest* req) {
+    req->send(200, "application/json", candleStateJson());
+  });
+
+  // ---- POST /api/candles ----
+  auto* candleH = new AsyncCallbackJsonWebHandler("/api/candles",
+    [](AsyncWebServerRequest* req, JsonVariant& json) {
+      candleState.on = json["on"].as<bool>();
+      applyCandles();
+      saveCandleState();
+      req->send(200, "application/json", "{\"ok\":true}");
+    });
+  server.addHandler(candleH);
+
+  // ---- GET /api/candle/schedules ----
+  server.on("/api/candle/schedules", HTTP_GET, [](AsyncWebServerRequest* req) {
+    req->send(200, "application/json", candleSchedsJson());
+  });
+
+  // ---- POST /api/candle/schedules  (add) ----
+  auto* addCandleSchedH = new AsyncCallbackJsonWebHandler("/api/candle/schedules",
+    [](AsyncWebServerRequest* req, JsonVariant& json) {
+      JsonObject obj = json.as<JsonObject>();
+      CandleSchedule s;
+      s.id      = makeId();
+      s.time    = obj["time"].as<String>();
+      s.on      = obj["on"]      | true;
+      s.enabled = obj["enabled"] | true;
+      JsonArray d = obj["days"].as<JsonArray>();
+      for (int i = 0; i < 7 && i < (int)d.size(); i++) s.days[i] = (bool)d[i];
+      candleScheds.push_back(s);
+      saveCandleScheds();
+      req->send(200, "application/json", "{\"ok\":true,\"id\":\"" + s.id + "\"}");
+    });
+  server.addHandler(addCandleSchedH);
+
+  // ---- POST /api/candle/schedule/delete ----
+  auto* delCandleH = new AsyncCallbackJsonWebHandler("/api/candle/schedule/delete",
+    [](AsyncWebServerRequest* req, JsonVariant& json) {
+      String id = json["id"].as<String>();
+      candleScheds.erase(std::remove_if(candleScheds.begin(), candleScheds.end(),
+        [&id](const CandleSchedule& s){ return s.id == id; }), candleScheds.end());
+      saveCandleScheds();
+      req->send(200, "application/json", "{\"ok\":true}");
+    });
+  server.addHandler(delCandleH);
+
+  // ---- POST /api/candle/schedule/toggle ----
+  auto* togCandleH = new AsyncCallbackJsonWebHandler("/api/candle/schedule/toggle",
+    [](AsyncWebServerRequest* req, JsonVariant& json) {
+      String id      = json["id"].as<String>();
+      bool   enabled = json["enabled"].as<bool>();
+      for (auto& s : candleScheds) {
+        if (s.id == id) { s.enabled = enabled; break; }
+      }
+      saveCandleScheds();
+      req->send(200, "application/json", "{\"ok\":true}");
+    });
+  server.addHandler(togCandleH);
 }
 
 // ============================================================
@@ -792,6 +1075,10 @@ void setup() {
   ledcWrite(LEDC_CH_WARM, 0);
   ledcWrite(LEDC_CH_COOL, 0);
 
+  // Candle channel
+  pinMode(PIN_CANDLES, OUTPUT);
+  digitalWrite(PIN_CANDLES, LOW);
+
   // SPIFFS
   if (!SPIFFS.begin(true)) {
     Serial.println("[SPIFFS] Mount failed — formatting…");
@@ -801,7 +1088,10 @@ void setup() {
   loadState();
   loadSchedules();
   loadSensorCfg();
+  loadCandleState();
+  loadCandleScheds();
   applyState(currentState);
+  applyCandles();
 
   // WiFi
   WiFi.mode(WIFI_STA);
@@ -837,6 +1127,11 @@ void loop() {
   if (now - lastScheduleCheck >= 30000) {
     lastScheduleCheck = now;
     checkSchedules();
+  }
+
+  if (now - lastCandleSchedCheck >= 30000) {
+    lastCandleSchedCheck = now;
+    checkCandleSchedules();
   }
 
   // Sensor check — every 2 s

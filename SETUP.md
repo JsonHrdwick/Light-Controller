@@ -23,9 +23,9 @@ ESP32-based PWM controller for dual-channel (warm white + cool white) LED strips
 | Qty | Part | Notes |
 |-----|------|-------|
 | 1 | ESP32 development board | Any standard 38-pin devkit works (WROOM, WROVER) |
-| 2 | N-channel MOSFET (logic-level) | IRLZ44N (through-hole). Must be **logic-level** — turns fully on at 3.3V gate. Standard IRFZ44N will NOT work |
-| 2 | 100Ω resistor | Gate resistors, one per MOSFET — limits current spike when gate capacitance charges |
-| 2 | 10kΩ resistor | Gate pull-downs to GND (one per MOSFET); one also used for LDR voltage divider |
+| 3 | N-channel MOSFET (logic-level) | IRLZ44N (through-hole). Must be **logic-level** — turns fully on at 3.3V gate. Standard IRFZ44N will NOT work. Third unit switches the candle circuit |
+| 3 | 100Ω resistor | Gate resistors, one per MOSFET |
+| 3 | 10kΩ resistor | Gate pull-downs to GND (one per MOSFET); one also used for LDR voltage divider |
 | 1 | LDR (photoresistor) | Standard GL5528 or equivalent |
 | 1 | 24V DC power supply | Sized for your strip — typical strips draw ~1A/meter per channel |
 | 1 | LM2596 DC-DC buck converter module | Steps 24V down to 5V for the ESP32. Adjust the onboard trimmer pot to 5.0V output **before** connecting the ESP32 |
@@ -130,7 +130,26 @@ The 10kΩ resistor from each gate to GND ensures the MOSFET is held off when the
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- SECTION 5 — LIGHT SENSOR (LDR)
+ SECTION 5 — CANDLE CHANNEL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  GPIO 27 ──── [100Ω] ──┬──── IRLZ44N (Q3) Gate
+                         │
+                       [10kΩ]
+                         │
+                       GND rail
+
+                         IRLZ44N (Q3) Drain  ──── Candle GND rail (shared −)
+                         IRLZ44N (Q3) Source ──── GND rail
+
+  ESP32 3.3V ──────────────────────────────────── Candle 3.3V rail (shared +)
+
+  ⚠ All 9 candles share the same + and − rails. Typical draw is
+    well under 200mA total — safely within the ESP32's 3.3V output.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 6 — LIGHT SENSOR (LDR)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   ESP32 3.3V ──── [LDR] ──┬──── GPIO 34
@@ -149,6 +168,7 @@ The 10kΩ resistor from each gate to GND ensures the MOSFET is held off when the
   ESP32 GND
   IRLZ44N Q1 Source
   IRLZ44N Q2 Source
+  IRLZ44N Q3 Source
 ```
 
 **How each channel works:**
@@ -332,4 +352,6 @@ The default threshold in the code is `500`. Set it in the web UI after installat
 | Schedules don't fire | NTP not synced | Ensure ESP32 has internet access; check timezone offset |
 | LDR threshold never triggers | Divider resistor wrong way | 3.3V → LDR → GPIO34 → 10kΩ → GND (not reversed) |
 | ADC reading stuck at 0 | Using GPIO 34 as output | GPIO 34 is input-only; do not reassign it |
+| Candles don't switch | Wrong MOSFET or bad gate joint | Confirm IRLZ44N (logic-level); check gate resistor is 100Ω not 10kΩ |
+| Candles flicker | Loose GND rail connection | All 9 candle − leads must share a solid common rail to Q3 Drain |
 | All settings lost on reboot | SPIFFS not formatted | Set partition scheme to "Default 4MB with spiffs" and reflash |
