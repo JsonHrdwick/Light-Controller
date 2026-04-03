@@ -78,7 +78,8 @@ struct SensorConfig {
   bool    enabled   = false;
   int     threshold = 500;   // ADC 0–4095; reading BELOW this → "dark"
   String  action    = "dim"; // "dim" | "off" | "on"
-  uint8_t dimLevel  = 20;    // brightness % used when action == "dim"
+  uint8_t dimLevel    = 20;  // brightness % used when action == "dim"
+  uint8_t dimColorTemp = 0;  // color temp % used when action == "dim" (0 = full warm)
 };
 
 struct CandleState {
@@ -115,18 +116,45 @@ unsigned long lastCandleSchedCheck = 0;
 int           lastCandleMinChecked = -1;
 
 // ============================================================
+//  Smooth transition state
+// ============================================================
+static float transWarm = 0.0f;   // current PWM output (float for sub-step precision)
+static float transCool = 0.0f;
+static float targetWarm = 0.0f;  // desired PWM target
+static float targetCool = 0.0f;
+static unsigned long lastTransStep = 0;
+#define TRANS_INTERVAL_MS 20     // step every 20 ms (~50 Hz)
+#define TRANS_DURATION_MS 500    // full 0→255 sweep in 500 ms
+
+// ============================================================
 //  PWM helpers
 // ============================================================
+
+// Set transition targets — actual PWM is updated gradually in stepTransition()
 void applyState(const LightState& s) {
   if (!s.on) {
-    ledcWrite(LEDC_CH_WARM, 0);
-    ledcWrite(LEDC_CH_COOL, 0);
+    targetWarm = 0.0f;
+    targetCool = 0.0f;
     return;
   }
   float bri = constrain(s.brightness, 1, 100) / 100.0f;
   float ct  = constrain(s.colorTemp,  0, 100) / 100.0f;
-  ledcWrite(LEDC_CH_WARM, (uint8_t)(255.0f * bri * (1.0f - ct)));
-  ledcWrite(LEDC_CH_COOL, (uint8_t)(255.0f * bri * ct));
+  targetWarm = 255.0f * bri * (1.0f - ct);
+  targetCool = 255.0f * bri * ct;
+}
+
+// Move current PWM values one step toward their targets
+void stepTransition() {
+  const float maxStep = (255.0f * TRANS_INTERVAL_MS) / TRANS_DURATION_MS;
+  auto approach = [](float cur, float tgt, float step) -> float {
+    float d = tgt - cur;
+    if (fabsf(d) <= step) return tgt;
+    return cur + (d > 0.0f ? step : -step);
+  };
+  transWarm = approach(transWarm, targetWarm, maxStep);
+  transCool = approach(transCool, targetCool, maxStep);
+  ledcWrite(LEDC_CH_WARM, (uint8_t)transWarm);
+  ledcWrite(LEDC_CH_COOL, (uint8_t)transCool);
 }
 
 void applyCandles() {
@@ -207,7 +235,8 @@ void saveSensorCfg() {
   doc["enabled"]   = sensorCfg.enabled;
   doc["threshold"] = sensorCfg.threshold;
   doc["action"]    = sensorCfg.action;
-  doc["dimLevel"]  = sensorCfg.dimLevel;
+  doc["dimLevel"]    = sensorCfg.dimLevel;
+  doc["dimColorTemp"] = sensorCfg.dimColorTemp;
   serializeJson(doc, f);
   f.close();
 }
@@ -221,7 +250,8 @@ void loadSensorCfg() {
     sensorCfg.enabled   = doc["enabled"]   | false;
     sensorCfg.threshold = doc["threshold"] | 500;
     sensorCfg.action    = doc["action"] | "dim";
-    sensorCfg.dimLevel  = doc["dimLevel"]  | 20;
+    sensorCfg.dimLevel    = doc["dimLevel"]    | 20;
+    sensorCfg.dimColorTemp = doc["dimColorTemp"] | 0;
   }
   f.close();
 }
@@ -302,12 +332,22 @@ void checkSchedules() {
     if (!s.days[dow])     continue;
     if (s.time != hhmm)   continue;
 
-    currentState.on         = (s.brightness > 0);
-    currentState.brightness = s.brightness;
-    currentState.colorTemp  = s.colorTemp;
-    applyState(currentState);
-    saveState();
-    Serial.printf("[Schedule] Fired: %s  bri=%d  ct=%d\n", hhmm, s.brightness, s.colorTemp);
+    LightState scheduled;
+    scheduled.on         = (s.brightness > 0);
+    scheduled.brightness = s.brightness;
+    scheduled.colorTemp  = s.colorTemp;
+
+    if (sensorTriggered) {
+      // Sensor has precedence — store schedule as the state to restore when dark ends
+      preTriggerState = scheduled;
+      saveState();  // persist so a reboot also gets the right state
+      Serial.printf("[Schedule] Fired during dark: %s  bri=%d  ct=%d  (deferred)\n", hhmm, s.brightness, s.colorTemp);
+    } else {
+      currentState = scheduled;
+      applyState(currentState);
+      saveState();
+      Serial.printf("[Schedule] Fired: %s  bri=%d  ct=%d\n", hhmm, s.brightness, s.colorTemp);
+    }
   }
 }
 
@@ -346,23 +386,27 @@ void checkLightSensor() {
   if (dark && !sensorTriggered) {
     preTriggerState = currentState;
     sensorTriggered = true;
+    Serial.printf("[Sensor] Dark (ADC=%d). Saving state: on=%d bri=%d ct=%d. Action: %s\n",
+      reading, preTriggerState.on, preTriggerState.brightness, preTriggerState.colorTemp,
+      sensorCfg.action.c_str());
     if (sensorCfg.action == "on") {
       currentState.on = true;
       currentState.brightness = 100;
     } else if (sensorCfg.action == "off") {
       currentState.on = false;
     } else { // "dim"
-      currentState.on = true;
+      currentState.on         = true;
       currentState.brightness = sensorCfg.dimLevel;
+      currentState.colorTemp  = sensorCfg.dimColorTemp;
     }
     applyState(currentState);
-    Serial.printf("[Sensor] Dark triggered (ADC=%d). Action: %s\n", reading, sensorCfg.action.c_str());
 
   } else if (!dark && sensorTriggered) {
-    currentState    = preTriggerState;
     sensorTriggered = false;
+    currentState    = preTriggerState;
+    Serial.printf("[Sensor] Light restored (ADC=%d). Restoring: on=%d bri=%d ct=%d\n",
+      reading, currentState.on, currentState.brightness, currentState.colorTemp);
     applyState(currentState);
-    Serial.printf("[Sensor] Light restored (ADC=%d)\n", reading);
   }
 }
 
@@ -437,7 +481,7 @@ input[type=time],input[type=number],select{background:var(--bg);border:1px solid
   <h2>Quick Actions</h2>
   <div class="qa-grid">
     <button class="qa-btn" id="qaOnOff" onclick="qaTogglePower()">
-      <span class="qa-icon">&#x23FB;</span>
+      <span class="qa-icon">&#x25CF;</span>
       <span class="qa-lbl">Power</span>
     </button>
     <button class="qa-btn" id="qaSensor" onclick="qaToggleSensor()">
@@ -497,8 +541,8 @@ input[type=time],input[type=number],select{background:var(--bg);border:1px solid
 <div class="card">
   <h2>Schedules</h2>
   <div id="schedList"><p style="color:var(--muted);font-size:.78rem">No schedules yet.</p></div>
-  <details id="addForm">
-    <summary>+ Add Schedule</summary>
+  <details id="addForm" ontoggle="onAddFormToggle(this)">
+    <summary id="addFormSummary">+ Add Schedule</summary>
     <div style="margin-top:12px">
       <div class="frow">
         <div class="fg"><label>Time</label><input type="time" id="nTime" value="08:00"></div>
@@ -515,7 +559,7 @@ input[type=time],input[type=number],select{background:var(--bg);border:1px solid
         <span class="day on" data-d="5">Fr</span>
         <span class="day" data-d="6">Sa</span>
       </div>
-      <button class="btn-p" style="margin-top:12px" onclick="addSchedule()">Save Schedule</button>
+      <button class="btn-p" id="addFormBtn" style="margin-top:12px" onclick="addSchedule()">Save Schedule</button>
     </div>
   </details>
 </div>
@@ -552,6 +596,11 @@ input[type=time],input[type=number],select{background:var(--bg);border:1px solid
     <label class="lbl">Dim Level</label>
     <input type="range" id="senDim" min="1" max="100" value="20" oninput="document.getElementById('senDimV').textContent=this.value+'%'" onchange="saveSensor()">
     <span class="val" id="senDimV">20%</span>
+  </div>
+  <div class="row" id="dimCtRow">
+    <label class="lbl">Dim Color Temp</label>
+    <input type="range" id="senDimCt" min="0" max="100" value="0" oninput="document.getElementById('senDimCtV').textContent=this.value+'%'" onchange="saveSensor()">
+    <span class="val" id="senDimCtV">0%</span>
   </div>
 </div>
 
@@ -605,11 +654,12 @@ const DN = ['Su','Mo','Tu','We','Th','Fr','Sa'];
 function onBri(v){ document.getElementById('briV').textContent = v+'%' }
 function onCt(v){
   const t = v<15?'Warm':v>85?'Cool':v<40?'Warm-ish':v>60?'Cool-ish':'Neutral';
-  document.getElementById('ctV').textContent = t;
+  document.getElementById('ctV').textContent = t+' ('+v+'%)';
 }
 function onSenAct(){
-  document.getElementById('dimRow').style.display =
-    document.getElementById('senAct').value==='dim' ? 'flex' : 'none';
+  const isDim = document.getElementById('senAct').value==='dim';
+  document.getElementById('dimRow').style.display   = isDim ? 'flex' : 'none';
+  document.getElementById('dimCtRow').style.display = isDim ? 'flex' : 'none';
 }
 
 // ---- State ----
@@ -631,6 +681,7 @@ function loadState(){
 
 // ---- Schedules ----
 let scheds = [];
+let editingId = null;
 function loadSchedules(){
   get('/api/schedules', data=>{ scheds=data; renderSchedules(); updateQaStates(); });
 }
@@ -648,20 +699,57 @@ function renderSchedules(){
         <input type="checkbox" ${s.enabled?'checked':''} onchange="toggleSched('${s.id}',this.checked)">
         <span class="tslider"></span>
       </label>
+      <button class="btn-s" onclick="editSched('${s.id}')">&#x270E;</button>
       <button class="btn-d btn-s" onclick="deleteSched('${s.id}')">&#x2715;</button>
     </div>`).join('');
+}
+function editSched(id){
+  const s = scheds.find(x=>x.id===id);
+  if(!s) return;
+  editingId = id;
+  document.getElementById('nTime').value = s.time;
+  document.getElementById('nBri').value  = s.brightness;
+  document.getElementById('nCt').value   = s.colorTemp;
+  document.querySelectorAll('#nDays .day').forEach(el=>{
+    el.classList.toggle('on', !!s.days[+el.dataset.d]);
+  });
+  document.getElementById('addFormSummary').textContent = 'Edit Schedule';
+  document.getElementById('addFormBtn').textContent = 'Update Schedule';
+  document.getElementById('addForm').open = true;
+}
+function onAddFormToggle(el){
+  if(!el.open && editingId){
+    editingId = null;
+    document.getElementById('addFormSummary').textContent = '+ Add Schedule';
+    document.getElementById('addFormBtn').textContent = 'Save Schedule';
+  }
 }
 function addSchedule(){
   const days=[0,0,0,0,0,0,0];
   document.querySelectorAll('#nDays .day').forEach(el=>{
     if(el.classList.contains('on')) days[+el.dataset.d]=1;
   });
-  post('/api/schedules',{
+  const payload={
     time: document.getElementById('nTime').value,
     brightness: +document.getElementById('nBri').value,
     colorTemp:  +document.getElementById('nCt').value,
     enabled: true, days
-  }, ()=>{ document.getElementById('addForm').removeAttribute('open'); loadSchedules(); });
+  };
+  if(editingId){
+    payload.id = editingId;
+    post('/api/schedule/update', payload, ()=>{
+      editingId=null;
+      document.getElementById('addFormSummary').textContent='+ Add Schedule';
+      document.getElementById('addFormBtn').textContent='Save Schedule';
+      document.getElementById('addForm').removeAttribute('open');
+      loadSchedules();
+    });
+  } else {
+    post('/api/schedules', payload, ()=>{
+      document.getElementById('addForm').removeAttribute('open');
+      loadSchedules();
+    });
+  }
 }
 function deleteSched(id){ post('/api/schedule/delete',{id},loadSchedules); }
 function toggleSched(id,enabled){ post('/api/schedule/toggle',{id,enabled},loadSchedules); }
@@ -679,6 +767,8 @@ function loadSensor(){
     document.getElementById('senAct').value  = d.action;
     document.getElementById('senDim').value  = d.dimLevel;
     document.getElementById('senDimV').textContent = d.dimLevel+'%';
+    document.getElementById('senDimCt').value = d.dimColorTemp;
+    document.getElementById('senDimCtV').textContent = d.dimColorTemp+'%';
     onSenAct(); updateQaStates();
   });
 }
@@ -686,8 +776,9 @@ function saveSensor(){
   post('/api/sensor',{
     enabled:   document.getElementById('senEn').checked,
     threshold: +document.getElementById('senThr').value,
-    action:    document.getElementById('senAct').value,
-    dimLevel:  +document.getElementById('senDim').value
+    action:       document.getElementById('senAct').value,
+    dimLevel:     +document.getElementById('senDim').value,
+    dimColorTemp: +document.getElementById('senDimCt').value
   });
 }
 
@@ -834,6 +925,14 @@ loadState(); loadSchedules(); loadSensor(); loadCandleState(); loadCandleScheds(
 setStatus('Connected');
 setInterval(tick, 15000);
 setInterval(pollSensor, 4000);
+
+let lastInteraction = 0;
+document.addEventListener('input', () => lastInteraction = Date.now());
+function pollState(){
+  if (Date.now() - lastInteraction < 2000) return;
+  loadState();
+}
+setInterval(pollState, 5000);
 </script>
 </body>
 </html>
@@ -855,7 +954,8 @@ String sensorJson() {
   doc["enabled"]   = sensorCfg.enabled;
   doc["threshold"] = sensorCfg.threshold;
   doc["action"]    = sensorCfg.action;
-  doc["dimLevel"]  = sensorCfg.dimLevel;
+  doc["dimLevel"]    = sensorCfg.dimLevel;
+  doc["dimColorTemp"] = sensorCfg.dimColorTemp;
   String s; serializeJson(doc, s); return s;
 }
 
@@ -949,6 +1049,26 @@ void setupRoutes() {
     });
   server.addHandler(addSchedH);
 
+  // ---- POST /api/schedule/update ----
+  auto* updSchedH = new AsyncCallbackJsonWebHandler("/api/schedule/update",
+    [](AsyncWebServerRequest* req, JsonVariant& json) {
+      JsonObject obj = json.as<JsonObject>();
+      String id = obj["id"].as<String>();
+      for (auto& s : schedules) {
+        if (s.id != id) continue;
+        s.time       = obj["time"].as<String>();
+        s.brightness = obj["brightness"] | s.brightness;
+        s.colorTemp  = obj["colorTemp"]  | s.colorTemp;
+        s.enabled    = obj["enabled"]    | s.enabled;
+        JsonArray d  = obj["days"].as<JsonArray>();
+        for (int i = 0; i < 7 && i < (int)d.size(); i++) s.days[i] = (bool)d[i];
+        break;
+      }
+      saveSchedules();
+      req->send(200, "application/json", "{\"ok\":true}");
+    });
+  server.addHandler(updSchedH);
+
   // ---- POST /api/schedule/delete ----
   auto* delSchedH = new AsyncCallbackJsonWebHandler("/api/schedule/delete",
     [](AsyncWebServerRequest* req, JsonVariant& json) {
@@ -991,7 +1111,8 @@ void setupRoutes() {
       if (obj.containsKey("enabled"))   sensorCfg.enabled   = obj["enabled"].as<bool>();
       if (obj.containsKey("threshold")) sensorCfg.threshold = obj["threshold"].as<int>();
       if (obj.containsKey("action"))    sensorCfg.action    = obj["action"].as<String>();
-      if (obj.containsKey("dimLevel"))  sensorCfg.dimLevel  = obj["dimLevel"].as<uint8_t>();
+      if (obj.containsKey("dimLevel"))    sensorCfg.dimLevel    = obj["dimLevel"].as<uint8_t>();
+      if (obj.containsKey("dimColorTemp")) sensorCfg.dimColorTemp = obj["dimColorTemp"].as<uint8_t>();
       saveSensorCfg();
       req->send(200, "application/json", "{\"ok\":true}");
     });
@@ -1091,6 +1212,11 @@ void setup() {
   loadCandleState();
   loadCandleScheds();
   applyState(currentState);
+  // Snap transition to saved state on boot — no unwanted fade-in
+  transWarm = targetWarm;
+  transCool = targetCool;
+  ledcWrite(LEDC_CH_WARM, (uint8_t)transWarm);
+  ledcWrite(LEDC_CH_COOL, (uint8_t)transCool);
   applyCandles();
 
   // WiFi
@@ -1122,6 +1248,12 @@ void setup() {
 // ============================================================
 void loop() {
   unsigned long now = millis();
+
+  // Smooth PWM transition — runs at ~50 Hz
+  if (now - lastTransStep >= TRANS_INTERVAL_MS) {
+    lastTransStep = now;
+    stepTransition();
+  }
 
   // Schedule check — every 30 s is fine, deduplicated by minute
   if (now - lastScheduleCheck >= 30000) {
