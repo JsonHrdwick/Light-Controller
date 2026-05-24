@@ -30,10 +30,9 @@
 #include <algorithm>
 
 // ============================================================
-// USER CONFIGURATION  —  edit these before flashing
+// USER CONFIGURATION  —  edit credentials.ini (never committed)
 // ============================================================
-const char* WIFI_SSID     = "Camburn";
-const char* WIFI_PASSWORD = "MeowMeow";
+// WIFI_SSID and WIFI_PASSWORD are injected as macros from credentials.ini
 
 // Timezone: seconds offset from UTC
 //  UTC-5 (US Eastern Standard) = -18000
@@ -94,6 +93,17 @@ struct CandleSchedule {
   bool    days[7]; // index 0 = Sunday … 6 = Saturday
 };
 
+struct SensorSchedule {
+  String  id;
+  String  time;          // "HH:MM" 24-hour
+  bool    sensorEnabled; // true = enable sensor, false = disable sensor
+  String  action;        // "dim" | "off" | "on"
+  uint8_t dimLevel;      // brightness % when action=="dim"
+  uint8_t dimColorTemp;  // color temp % when action=="dim"
+  bool    enabled;       // whether this schedule entry is active
+  bool    days[7];
+};
+
 // ============================================================
 //  Globals
 // ============================================================
@@ -114,6 +124,10 @@ CandleState candleState;
 std::vector<CandleSchedule> candleScheds;
 unsigned long lastCandleSchedCheck = 0;
 int           lastCandleMinChecked = -1;
+
+std::vector<SensorSchedule> sensorScheds;
+unsigned long lastSensorSchedCheck = 0;
+int           lastSensorMinChecked = -1;
 
 // ============================================================
 //  Smooth transition state
@@ -312,6 +326,50 @@ void loadCandleScheds() {
   f.close();
 }
 
+void saveSensorScheds() {
+  File f = SPIFFS.open("/sensor_scheds.json", "w");
+  if (!f) return;
+  DynamicJsonDocument doc(4096);
+  JsonArray arr = doc.to<JsonArray>();
+  for (auto& s : sensorScheds) {
+    JsonObject obj = arr.createNestedObject();
+    obj["id"]            = s.id;
+    obj["time"]          = s.time;
+    obj["sensorEnabled"] = s.sensorEnabled;
+    obj["action"]        = s.action;
+    obj["dimLevel"]      = s.dimLevel;
+    obj["dimColorTemp"]  = s.dimColorTemp;
+    obj["enabled"]       = s.enabled;
+    JsonArray d = obj.createNestedArray("days");
+    for (int i = 0; i < 7; i++) d.add(s.days[i]);
+  }
+  serializeJson(doc, f);
+  f.close();
+}
+
+void loadSensorScheds() {
+  if (!SPIFFS.exists("/sensor_scheds.json")) return;
+  File f = SPIFFS.open("/sensor_scheds.json", "r");
+  if (!f) return;
+  DynamicJsonDocument doc(4096);
+  if (deserializeJson(doc, f)) { f.close(); return; }
+  sensorScheds.clear();
+  for (JsonObject obj : doc.as<JsonArray>()) {
+    SensorSchedule s;
+    s.id            = obj["id"].as<String>();
+    s.time          = obj["time"].as<String>();
+    s.sensorEnabled = obj["sensorEnabled"] | true;
+    s.action        = obj["action"] | "dim";
+    s.dimLevel      = obj["dimLevel"]     | 20;
+    s.dimColorTemp  = obj["dimColorTemp"] | 0;
+    s.enabled       = obj["enabled"]      | true;
+    JsonArray d = obj["days"].as<JsonArray>();
+    for (int i = 0; i < 7 && i < (int)d.size(); i++) s.days[i] = (bool)d[i];
+    sensorScheds.push_back(s);
+  }
+  f.close();
+}
+
 // ============================================================
 //  Schedule checker  (called once per minute)
 // ============================================================
@@ -371,6 +429,34 @@ void checkCandleSchedules() {
     applyCandles();
     saveCandleState();
     Serial.printf("[CandleSched] Fired: %s  on=%d\n", hhmm, s.on);
+  }
+}
+
+void checkSensorSchedules() {
+  struct tm ti;
+  if (!getLocalTime(&ti)) return;
+
+  int minute = ti.tm_hour * 60 + ti.tm_min;
+  if (minute == lastSensorMinChecked) return;
+  lastSensorMinChecked = minute;
+
+  char hhmm[6];
+  snprintf(hhmm, sizeof(hhmm), "%02d:%02d", ti.tm_hour, ti.tm_min);
+  int dow = ti.tm_wday;
+
+  for (auto& s : sensorScheds) {
+    if (!s.enabled)     continue;
+    if (!s.days[dow])   continue;
+    if (s.time != hhmm) continue;
+    sensorCfg.enabled = s.sensorEnabled;
+    if (s.sensorEnabled) {
+      sensorCfg.action       = s.action;
+      sensorCfg.dimLevel     = s.dimLevel;
+      sensorCfg.dimColorTemp = s.dimColorTemp;
+    }
+    saveSensorCfg();
+    Serial.printf("[SensorSched] Fired: %s  enabled=%d  action=%s  dim=%d  ct=%d\n",
+      hhmm, s.sensorEnabled, s.action.c_str(), s.dimLevel, s.dimColorTemp);
   }
 }
 
@@ -602,6 +688,47 @@ input[type=time],input[type=number],select{background:var(--bg);border:1px solid
     <input type="range" id="senDimCt" min="0" max="100" value="0" oninput="document.getElementById('senDimCtV').textContent=this.value+'%'" onchange="saveSensor()">
     <span class="val" id="senDimCtV">0%</span>
   </div>
+  <div id="senSchedList" style="margin-top:10px"></div>
+  <details id="senAddForm" ontoggle="onSenAddFormToggle(this)">
+    <summary id="senAddFormSummary">+ Add Schedule</summary>
+    <div style="margin-top:12px">
+      <div class="frow">
+        <div class="fg"><label>Time</label><input type="time" id="ssTime" value="20:00"></div>
+        <div class="fg"><label>Sensor</label>
+          <select id="ssSensor" onchange="onSsSensor()">
+            <option value="on">Enable</option>
+            <option value="off">Disable</option>
+          </select>
+        </div>
+      </div>
+      <div id="ssActionGroup">
+        <div class="frow">
+          <div class="fg"><label>When Dark</label>
+            <select id="ssAct" onchange="onSsAct()">
+              <option value="dim">Dim to level</option>
+              <option value="off">Turn off</option>
+              <option value="on">Turn on (full)</option>
+            </select>
+          </div>
+        </div>
+        <div class="frow" id="ssDimGroup">
+          <div class="fg"><label>Dim Level %</label><input type="number" id="ssDim" min="1" max="100" value="20" style="width:64px"></div>
+          <div class="fg"><label>Color Temp %</label><input type="number" id="ssDimCt" min="0" max="100" value="0" style="width:64px"></div>
+        </div>
+      </div>
+      <div style="font-size:.72rem;color:var(--muted);margin-bottom:6px">Days active:</div>
+      <div class="days" id="ssDays">
+        <span class="day" data-d="0">Su</span>
+        <span class="day on" data-d="1">Mo</span>
+        <span class="day on" data-d="2">Tu</span>
+        <span class="day on" data-d="3">We</span>
+        <span class="day on" data-d="4">Th</span>
+        <span class="day on" data-d="5">Fr</span>
+        <span class="day" data-d="6">Sa</span>
+      </div>
+      <button class="btn-p" id="ssBtn" style="margin-top:12px" onclick="addSensorSched()">Save Schedule</button>
+    </div>
+  </details>
 </div>
 
 <!-- CANDLES CARD -->
@@ -851,6 +978,101 @@ document.querySelectorAll('#cDays .day').forEach(el=>{
   el.addEventListener('click',()=>el.classList.toggle('on'));
 });
 
+// ---- Sensor Schedules ----
+let senScheds = [];
+let senEditingId = null;
+function onSsSensor(){
+  const en = document.getElementById('ssSensor').value === 'on';
+  document.getElementById('ssActionGroup').style.display = en ? '' : 'none';
+}
+function onSsAct(){
+  const isDim = document.getElementById('ssAct').value === 'dim';
+  document.getElementById('ssDimGroup').style.display = isDim ? '' : 'none';
+}
+function loadSensorScheds(){
+  get('/api/sensor/schedules', data=>{ senScheds=data; renderSensorScheds(); });
+}
+function renderSensorScheds(){
+  const el = document.getElementById('senSchedList');
+  if(!senScheds.length){ el.innerHTML='<p style="color:var(--muted);font-size:.78rem;margin-bottom:8px">No schedules yet.</p>'; return; }
+  el.innerHTML = senScheds.map(s=>{
+    let info = s.sensorEnabled
+      ? (s.action==='dim' ? `Dim ${s.dimLevel}% / CT ${s.dimColorTemp}%` : s.action==='off' ? 'Turn off' : 'Turn on (full)')
+      : '<span style="color:var(--muted)">Disable sensor</span>';
+    return `<div class="sched-item">
+      <span class="sched-time">${s.time}</span>
+      <span class="sched-info">
+        <span style="color:${s.sensorEnabled?'var(--accent)':'var(--muted)'}">Sensor ${s.sensorEnabled?'ON':'OFF'}</span>${s.sensorEnabled?' — '+info:''}
+        <div class="days">${[0,1,2,3,4,5,6].map(i=>`<span class="day ${s.days[i]?'on':''}">${DN[i]}</span>`).join('')}</div>
+      </span>
+      <label class="tog" style="width:44px;height:24px">
+        <input type="checkbox" ${s.enabled?'checked':''} onchange="toggleSensorSched('${s.id}',this.checked)">
+        <span class="tslider"></span>
+      </label>
+      <button class="btn-s" onclick="editSensorSched('${s.id}')">&#x270E;</button>
+      <button class="btn-d btn-s" onclick="deleteSensorSched('${s.id}')">&#x2715;</button>
+    </div>`;
+  }).join('');
+}
+function editSensorSched(id){
+  const s = senScheds.find(x=>x.id===id);
+  if(!s) return;
+  senEditingId = id;
+  document.getElementById('ssTime').value = s.time;
+  document.getElementById('ssSensor').value = s.sensorEnabled ? 'on' : 'off';
+  document.getElementById('ssAct').value = s.action;
+  document.getElementById('ssDim').value = s.dimLevel;
+  document.getElementById('ssDimCt').value = s.dimColorTemp;
+  document.querySelectorAll('#ssDays .day').forEach(el=>{
+    el.classList.toggle('on', !!s.days[+el.dataset.d]);
+  });
+  onSsSensor(); onSsAct();
+  document.getElementById('senAddFormSummary').textContent = 'Edit Schedule';
+  document.getElementById('ssBtn').textContent = 'Update Schedule';
+  document.getElementById('senAddForm').open = true;
+}
+function onSenAddFormToggle(el){
+  if(!el.open && senEditingId){
+    senEditingId = null;
+    document.getElementById('senAddFormSummary').textContent = '+ Add Schedule';
+    document.getElementById('ssBtn').textContent = 'Save Schedule';
+  }
+}
+function addSensorSched(){
+  const days=[0,0,0,0,0,0,0];
+  document.querySelectorAll('#ssDays .day').forEach(el=>{
+    if(el.classList.contains('on')) days[+el.dataset.d]=1;
+  });
+  const payload={
+    time: document.getElementById('ssTime').value,
+    sensorEnabled: document.getElementById('ssSensor').value==='on',
+    action: document.getElementById('ssAct').value,
+    dimLevel: +document.getElementById('ssDim').value,
+    dimColorTemp: +document.getElementById('ssDimCt').value,
+    enabled: true, days
+  };
+  if(senEditingId){
+    payload.id = senEditingId;
+    post('/api/sensor/schedule/update', payload, ()=>{
+      senEditingId=null;
+      document.getElementById('senAddFormSummary').textContent='+ Add Schedule';
+      document.getElementById('ssBtn').textContent='Save Schedule';
+      document.getElementById('senAddForm').removeAttribute('open');
+      loadSensorScheds();
+    });
+  } else {
+    post('/api/sensor/schedules', payload, ()=>{
+      document.getElementById('senAddForm').removeAttribute('open');
+      loadSensorScheds();
+    });
+  }
+}
+function deleteSensorSched(id){ post('/api/sensor/schedule/delete',{id},loadSensorScheds); }
+function toggleSensorSched(id,enabled){ post('/api/sensor/schedule/toggle',{id,enabled},loadSensorScheds); }
+document.querySelectorAll('#ssDays .day').forEach(el=>{
+  el.addEventListener('click',()=>el.classList.toggle('on'));
+});
+
 // ---- Quick Actions ----
 function updateQaStates(){
   document.getElementById('qaOnOff').classList.toggle('active', document.getElementById('pwr').checked);
@@ -921,7 +1143,7 @@ function tick(){
 }
 
 // ---- Init ----
-loadState(); loadSchedules(); loadSensor(); loadCandleState(); loadCandleScheds(); tick();
+loadState(); loadSchedules(); loadSensor(); loadSensorScheds(); loadCandleState(); loadCandleScheds(); tick();
 setStatus('Connected');
 setInterval(tick, 15000);
 setInterval(pollSensor, 4000);
@@ -988,6 +1210,24 @@ String candleSchedsJson() {
     obj["time"]    = s.time;
     obj["on"]      = s.on;
     obj["enabled"] = s.enabled;
+    JsonArray d = obj.createNestedArray("days");
+    for (int i = 0; i < 7; i++) d.add(s.days[i]);
+  }
+  String out; serializeJson(doc, out); return out;
+}
+
+String sensorSchedsJson() {
+  DynamicJsonDocument doc(4096);
+  JsonArray arr = doc.to<JsonArray>();
+  for (auto& s : sensorScheds) {
+    JsonObject obj = arr.createNestedObject();
+    obj["id"]            = s.id;
+    obj["time"]          = s.time;
+    obj["sensorEnabled"] = s.sensorEnabled;
+    obj["action"]        = s.action;
+    obj["dimLevel"]      = s.dimLevel;
+    obj["dimColorTemp"]  = s.dimColorTemp;
+    obj["enabled"]       = s.enabled;
     JsonArray d = obj.createNestedArray("days");
     for (int i = 0; i < 7; i++) d.add(s.days[i]);
   }
@@ -1118,6 +1358,77 @@ void setupRoutes() {
     });
   server.addHandler(sensorH);
 
+  // ---- GET /api/sensor/schedules ----
+  server.on("/api/sensor/schedules", HTTP_GET, [](AsyncWebServerRequest* req) {
+    req->send(200, "application/json", sensorSchedsJson());
+  });
+
+  // ---- POST /api/sensor/schedules  (add) ----
+  auto* addSenSchedH = new AsyncCallbackJsonWebHandler("/api/sensor/schedules",
+    [](AsyncWebServerRequest* req, JsonVariant& json) {
+      JsonObject obj = json.as<JsonObject>();
+      SensorSchedule s;
+      s.id            = makeId();
+      s.time          = obj["time"].as<String>();
+      s.sensorEnabled = obj["sensorEnabled"] | true;
+      s.action        = obj["action"] | "dim";
+      s.dimLevel      = obj["dimLevel"]     | 20;
+      s.dimColorTemp  = obj["dimColorTemp"] | 0;
+      s.enabled       = obj["enabled"]      | true;
+      JsonArray d = obj["days"].as<JsonArray>();
+      for (int i = 0; i < 7 && i < (int)d.size(); i++) s.days[i] = (bool)d[i];
+      sensorScheds.push_back(s);
+      saveSensorScheds();
+      req->send(200, "application/json", "{\"ok\":true,\"id\":\"" + s.id + "\"}");
+    });
+  server.addHandler(addSenSchedH);
+
+  // ---- POST /api/sensor/schedule/update ----
+  auto* updSenSchedH = new AsyncCallbackJsonWebHandler("/api/sensor/schedule/update",
+    [](AsyncWebServerRequest* req, JsonVariant& json) {
+      JsonObject obj = json.as<JsonObject>();
+      String id = obj["id"].as<String>();
+      for (auto& s : sensorScheds) {
+        if (s.id != id) continue;
+        s.time          = obj["time"].as<String>();
+        s.sensorEnabled = obj["sensorEnabled"] | s.sensorEnabled;
+        s.action        = obj["action"] | s.action;
+        s.dimLevel      = obj["dimLevel"]     | s.dimLevel;
+        s.dimColorTemp  = obj["dimColorTemp"] | s.dimColorTemp;
+        s.enabled       = obj["enabled"]      | s.enabled;
+        JsonArray d = obj["days"].as<JsonArray>();
+        for (int i = 0; i < 7 && i < (int)d.size(); i++) s.days[i] = (bool)d[i];
+        break;
+      }
+      saveSensorScheds();
+      req->send(200, "application/json", "{\"ok\":true}");
+    });
+  server.addHandler(updSenSchedH);
+
+  // ---- POST /api/sensor/schedule/delete ----
+  auto* delSenSchedH = new AsyncCallbackJsonWebHandler("/api/sensor/schedule/delete",
+    [](AsyncWebServerRequest* req, JsonVariant& json) {
+      String id = json["id"].as<String>();
+      sensorScheds.erase(std::remove_if(sensorScheds.begin(), sensorScheds.end(),
+        [&id](const SensorSchedule& s){ return s.id == id; }), sensorScheds.end());
+      saveSensorScheds();
+      req->send(200, "application/json", "{\"ok\":true}");
+    });
+  server.addHandler(delSenSchedH);
+
+  // ---- POST /api/sensor/schedule/toggle ----
+  auto* togSenSchedH = new AsyncCallbackJsonWebHandler("/api/sensor/schedule/toggle",
+    [](AsyncWebServerRequest* req, JsonVariant& json) {
+      String id      = json["id"].as<String>();
+      bool   enabled = json["enabled"].as<bool>();
+      for (auto& s : sensorScheds) {
+        if (s.id == id) { s.enabled = enabled; break; }
+      }
+      saveSensorScheds();
+      req->send(200, "application/json", "{\"ok\":true}");
+    });
+  server.addHandler(togSenSchedH);
+
   // ---- GET /api/candles ----
   server.on("/api/candles", HTTP_GET, [](AsyncWebServerRequest* req) {
     req->send(200, "application/json", candleStateJson());
@@ -1209,6 +1520,7 @@ void setup() {
   loadState();
   loadSchedules();
   loadSensorCfg();
+  loadSensorScheds();
   loadCandleState();
   loadCandleScheds();
   applyState(currentState);
@@ -1264,6 +1576,11 @@ void loop() {
   if (now - lastCandleSchedCheck >= 30000) {
     lastCandleSchedCheck = now;
     checkCandleSchedules();
+  }
+
+  if (now - lastSensorSchedCheck >= 30000) {
+    lastSensorSchedCheck = now;
+    checkSensorSchedules();
   }
 
   // Sensor check — every 2 s
