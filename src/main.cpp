@@ -1344,20 +1344,6 @@ void setupRoutes() {
     req->send(200, "application/json", sensorJson());
   });
 
-  // ---- POST /api/sensor ----
-  auto* sensorH = new AsyncCallbackJsonWebHandler("/api/sensor",
-    [](AsyncWebServerRequest* req, JsonVariant& json) {
-      JsonObject obj = json.as<JsonObject>();
-      if (obj.containsKey("enabled"))   sensorCfg.enabled   = obj["enabled"].as<bool>();
-      if (obj.containsKey("threshold")) sensorCfg.threshold = obj["threshold"].as<int>();
-      if (obj.containsKey("action"))    sensorCfg.action    = obj["action"].as<String>();
-      if (obj.containsKey("dimLevel"))    sensorCfg.dimLevel    = obj["dimLevel"].as<uint8_t>();
-      if (obj.containsKey("dimColorTemp")) sensorCfg.dimColorTemp = obj["dimColorTemp"].as<uint8_t>();
-      saveSensorCfg();
-      req->send(200, "application/json", "{\"ok\":true}");
-    });
-  server.addHandler(sensorH);
-
   // ---- GET /api/sensor/schedules ----
   server.on("/api/sensor/schedules", HTTP_GET, [](AsyncWebServerRequest* req) {
     req->send(200, "application/json", sensorSchedsJson());
@@ -1428,6 +1414,23 @@ void setupRoutes() {
       req->send(200, "application/json", "{\"ok\":true}");
     });
   server.addHandler(togSenSchedH);
+
+  // ---- POST /api/sensor ----
+  // NOTE: must be registered AFTER all /api/sensor/schedule* handlers.
+  // AsyncCallbackJsonWebHandler matches by prefix (url == uri || url.startsWith(uri+"/")),
+  // so "/api/sensor" would otherwise swallow every "/api/sensor/..." POST.
+  auto* sensorH = new AsyncCallbackJsonWebHandler("/api/sensor",
+    [](AsyncWebServerRequest* req, JsonVariant& json) {
+      JsonObject obj = json.as<JsonObject>();
+      if (obj.containsKey("enabled"))   sensorCfg.enabled   = obj["enabled"].as<bool>();
+      if (obj.containsKey("threshold")) sensorCfg.threshold = obj["threshold"].as<int>();
+      if (obj.containsKey("action"))    sensorCfg.action    = obj["action"].as<String>();
+      if (obj.containsKey("dimLevel"))    sensorCfg.dimLevel    = obj["dimLevel"].as<uint8_t>();
+      if (obj.containsKey("dimColorTemp")) sensorCfg.dimColorTemp = obj["dimColorTemp"].as<uint8_t>();
+      saveSensorCfg();
+      req->send(200, "application/json", "{\"ok\":true}");
+    });
+  server.addHandler(sensorH);
 
   // ---- GET /api/candles ----
   server.on("/api/candles", HTTP_GET, [](AsyncWebServerRequest* req) {
