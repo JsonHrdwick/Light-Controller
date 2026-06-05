@@ -1339,14 +1339,18 @@ void setupRoutes() {
     req->send(200, "application/json", "{\"value\":" + String(v) + "}");
   });
 
+  // ---- GET /api/sensor/schedules ----
+  // NOTE: must be registered BEFORE GET /api/sensor. server.on() handlers match
+  // by prefix (url == uri || url.startsWith(uri+"/")), so "/api/sensor" would
+  // otherwise swallow GET "/api/sensor/schedules" and return the config object
+  // instead of the schedules array — leaving the UI stuck on "No schedules yet."
+  server.on("/api/sensor/schedules", HTTP_GET, [](AsyncWebServerRequest* req) {
+    req->send(200, "application/json", sensorSchedsJson());
+  });
+
   // ---- GET /api/sensor ----
   server.on("/api/sensor", HTTP_GET, [](AsyncWebServerRequest* req) {
     req->send(200, "application/json", sensorJson());
-  });
-
-  // ---- GET /api/sensor/schedules ----
-  server.on("/api/sensor/schedules", HTTP_GET, [](AsyncWebServerRequest* req) {
-    req->send(200, "application/json", sensorSchedsJson());
   });
 
   // ---- POST /api/sensor/schedules  (add) ----
